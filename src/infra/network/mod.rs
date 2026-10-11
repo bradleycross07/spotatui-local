@@ -3,10 +3,13 @@ pub mod dj;
 pub mod friends;
 pub mod ids;
 pub mod library;
+pub(crate) mod liked_cache;
+pub(crate) mod liked_songs_cache;
 pub mod mapping;
 pub mod metadata;
 pub mod native_shuffle;
 pub mod playback;
+pub(crate) mod playlist_cache;
 pub mod recommend;
 pub mod requests;
 pub mod search;
@@ -438,6 +441,50 @@ pub struct Network {
 struct Deferred {
   event: IoEvent,
   owner: PlaybackOwner,
+}
+
+/// Most events held back during one rate-limit window. Every held event is
+/// replayed when the window ends; Spotify's penalties can last most of a day,
+/// and an unbounded queue replayed all at once would earn a fresh 429 at once.
+/// The oldest events go first: after hours, the latest intent matters most.
+const DEFERRED_EVENT_CAP: usize = 32;
+
+/// Hold an event back for replay, keeping at most one playback refresh (they
+/// all fetch the same state, and every track change queues one) and at most
+/// [`DEFERRED_EVENT_CAP`] events overall.
+fn defer_bounded(deferred: &mut Vec<Deferred>, item: Deferred) {
+  if matches!(item.event, IoEvent::GetCurrentPlayback)
+    && deferred
+      .iter()
+      .any(|held| matches!(held.event, IoEvent::GetCurrentPlayback))
+  {
+    return;
+  }
+  if deferred.len() >= DEFERRED_EVENT_CAP {
+    log::debug!("rate-limit queue full: dropping the oldest held event");
+    deferred.remove(0);
+  }
+  deferred.push(item);
+}
+
+/// Upper bound for the status line's arithmetic; the gate's own cap is lower.
+const MAX_STATUS_WAIT_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The status line for an open rate-limit window. The status bar does not
+/// tick, so it names the end as a clock time, which stays true however long
+/// the message is shown, plus the total length of the wait.
+fn rate_limit_status(secs: u64, now: chrono::DateTime<chrono::Local>) -> String {
+  // Bounded by the gate (at most two days), so the cast cannot overflow.
+  let until = now + chrono::Duration::seconds(secs.min(MAX_STATUS_WAIT_SECS) as i64);
+  let when = if until.date_naive() == now.date_naive() {
+    until.format("%H:%M").to_string()
+  } else {
+    until.format("%a %H:%M").to_string()
+  };
+  format!(
+    "Spotify rate limit: blocked until {when} ({})",
+    requests::format_wait(secs)
+  )
 }
 
 /// Whether `queued`, the owner at deferral time, still holds the sink under
@@ -1160,14 +1207,17 @@ impl Network {
     if self.deferred.is_empty() {
       let secs = left.as_secs().max(1);
       self
-        .show_status_message(format!("Spotify rate limit: waiting {secs}s"), secs)
+        .show_status_message(rate_limit_status(secs, chrono::Local::now()), secs)
         .await;
     }
     let owner = self.app.lock().await.playback_owner();
-    self.deferred.push(Deferred {
-      event: io_event,
-      owner,
-    });
+    defer_bounded(
+      &mut self.deferred,
+      Deferred {
+        event: io_event,
+        owner,
+      },
+    );
     None
   }
 
@@ -1801,6 +1851,54 @@ fn party_yields_to_local_playback(app: &App) -> bool {
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn deferral_keeps_one_playback_refresh_and_caps_the_queue() {
+    let mut deferred = Vec::new();
+    for _ in 0..5 {
+      defer_bounded(
+        &mut deferred,
+        Deferred {
+          event: IoEvent::GetCurrentPlayback,
+          owner: crate::core::app::PlaybackOwner::Queue,
+        },
+      );
+    }
+    assert_eq!(deferred.len(), 1);
+
+    for _ in 0..(DEFERRED_EVENT_CAP * 2) {
+      defer_bounded(
+        &mut deferred,
+        Deferred {
+          event: IoEvent::PausePlayback,
+          owner: crate::core::app::PlaybackOwner::Queue,
+        },
+      );
+    }
+    assert_eq!(deferred.len(), DEFERRED_EVENT_CAP);
+    // The oldest held event (the refresh) was dropped to make room.
+    assert!(!deferred
+      .iter()
+      .any(|held| matches!(held.event, IoEvent::GetCurrentPlayback)));
+  }
+
+  #[test]
+  fn rate_limit_status_names_the_end_time_and_the_length() {
+    use chrono::TimeZone;
+    let now = chrono::Local
+      .with_ymd_and_hms(2026, 10, 3, 16, 20, 0)
+      .unwrap();
+    assert_eq!(
+      rate_limit_status(600, now),
+      "Spotify rate limit: blocked until 16:30 (10m 0s)"
+    );
+    let next_day = rate_limit_status(76_902, now);
+    assert!(
+      next_day.starts_with("Spotify rate limit: blocked until Sun 13:41"),
+      "{next_day}"
+    );
+    assert!(next_day.ends_with("(21h 21m)"), "{next_day}");
+  }
+
   use super::*;
   use crate::core::app::App;
   use crate::core::user_config::UserConfig;

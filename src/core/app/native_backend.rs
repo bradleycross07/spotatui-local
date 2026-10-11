@@ -47,6 +47,26 @@ pub struct NativeTrackInfo {
   pub image_url: Option<String>,
 }
 
+/// Largest length difference between two releases still counted as the same
+/// song when matching by title and artist.
+const SAME_SONG_DURATION_TOLERANCE_MS: u64 = 3000;
+
+impl NativeTrackInfo {
+  /// Whether `track` is the song this player is decoding, by title, first
+  /// artist and length. For when the ids differ: Spotify relinks a track to
+  /// another release available in the user's market, so librespot reports an
+  /// id the playlist row does not carry.
+  pub(crate) fn describes(&self, track: &TrackInfo) -> bool {
+    let same_text = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    same_text(&self.name, &track.name)
+      && match (self.artists.first(), track.artists.first()) {
+        (Some(a), Some(b)) => same_text(a, b),
+        _ => false,
+      }
+      && u64::from(self.duration_ms).abs_diff(track.duration_ms) <= SAME_SONG_DURATION_TOLERANCE_MS
+  }
+}
+
 #[cfg(feature = "streaming")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingStartPlayback {
@@ -678,5 +698,59 @@ mod tests {
 
     app.mark_native_handed_off();
     assert!(app.native_handoff_resume_pending());
+  }
+}
+
+#[cfg(test)]
+mod same_song_tests {
+  use super::*;
+
+  fn playing(name: &str, artist: &str, duration_ms: u32) -> NativeTrackInfo {
+    NativeTrackInfo {
+      name: name.to_string(),
+      artists: vec![artist.to_string()],
+      duration_ms,
+      ..NativeTrackInfo::default()
+    }
+  }
+
+  fn row(name: &str, artist: &str, duration_ms: u64) -> TrackInfo {
+    TrackInfo {
+      uri: None,
+      name: name.to_string(),
+      artists: vec![artist.to_string()],
+      album: String::new(),
+      duration_ms,
+      id: Some("0000000000000000000001".to_string()),
+      album_id: None,
+      artist_refs: Vec::new(),
+      is_playable: true,
+      is_local: false,
+      track_number: 1,
+      explicit: false,
+      image_url: None,
+      release_date: None,
+    }
+  }
+
+  #[test]
+  fn a_relinked_release_of_the_same_song_is_recognised() {
+    // Same song, another release: casing and a second of length may differ.
+    let info = playing("Fallen Down", "Toby Fox", 55_000);
+    assert!(info.describes(&row("fallen down ", "TOBY FOX", 56_200)));
+  }
+
+  #[test]
+  fn a_different_song_is_not_mistaken_for_the_playing_one() {
+    let info = playing("Fallen Down", "Toby Fox", 55_000);
+    assert!(!info.describes(&row("Fallen Down", "Someone Else", 55_000)));
+    assert!(!info.describes(&row("Fallen Down (Reprise)", "Toby Fox", 55_000)));
+    // Too different in length to be the same recording.
+    assert!(!info.describes(&row("Fallen Down", "Toby Fox", 65_000)));
+    let no_artist = NativeTrackInfo {
+      artists: Vec::new(),
+      ..info
+    };
+    assert!(!no_artist.describes(&row("Fallen Down", "Toby Fox", 55_000)));
   }
 }

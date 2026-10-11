@@ -433,6 +433,12 @@ async fn handle_player_events(
   let mut progress_watchdog_armed = false;
   let mut transport_recovery_pending = false;
   let mut pending_end_of_track = None;
+  // Set when a track ends on its own; the next TrackChanged then re-sends the
+  // Connect state once playback is under way (see `resend_connect_state`).
+  let mut resend_state_after_track_end = false;
+  // Bumped on every seek, so a quick run of skips re-sends the state once,
+  // after the last one.
+  let seek_generation = Arc::new(AtomicU64::new(0));
   let mut observed_connection_generation = 0_u64;
   let mut audibly_playing = shared_is_playing.load(Ordering::Relaxed);
   let mut last_position = shared_position.load(Ordering::Relaxed);
@@ -802,8 +808,21 @@ async fn handle_player_events(
           }
           app.instant_since_last_current_playback_poll = std::time::Instant::now();
         }
+
+        // A seek is sent straight to the player, so Spirc only learns it from
+        // this event and does not push the new position: re-send it.
+        let generation = seek_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        spawn_seek_state_resend(
+          Arc::clone(&app),
+          Arc::clone(&player),
+          Arc::clone(&seek_generation),
+          generation,
+        );
       }
       PlayerEvent::TrackChanged { audio_item } => {
+        if std::mem::take(&mut resend_state_after_track_end) {
+          spawn_connect_state_resend(Arc::clone(&app), Arc::clone(&player));
+        }
         playback_transition_generation.fetch_add(1, Ordering::Relaxed);
         use librespot_metadata::audio::UniqueFields;
 
@@ -1040,6 +1059,10 @@ async fn handle_player_events(
           );
           reissue_published_queue_slot(&player, &uri, desired_playing).await;
         }
+
+        // Spirc advances by itself on the paths that continue playback; a
+        // stopped or handed-over end needs no state re-sent.
+        resend_state_after_track_end = should_ensure_playback;
 
         if should_ensure_playback {
           pending_end_of_track = Some(previous_track_id.clone());
@@ -1336,6 +1359,63 @@ async fn request_full_streaming_recovery(
     request.continue_after_track = continue_after_track.or(request.continue_after_track);
     let _ = recovery_tx.send(request);
   }
+}
+
+/// How long after a gapless track change the Connect state is re-sent: long
+/// enough for Spirc to have handled the new track's Playing event.
+const CONNECT_STATE_RESEND_DELAY: Duration = Duration::from_millis(1500);
+
+/// Re-send the Connect state shortly after a track changed on its own, if this
+/// player is still current and playback is still meant to be playing.
+fn spawn_connect_state_resend(app: Arc<Mutex<App>>, player: Arc<StreamingPlayer>) {
+  tokio::spawn(async move {
+    tokio::time::sleep(CONNECT_STATE_RESEND_DELAY).await;
+    if !is_current_streaming_player(&app, &player).await {
+      return;
+    }
+    let playing = {
+      let app = app.lock().await;
+      app.native_is_playing == Some(true) && app.native_context_should_drive()
+    };
+    if playing {
+      info!("re-sending the connect state after a gapless track change");
+      player.resend_connect_state(true);
+    }
+  });
+}
+
+/// How long after a seek the state is re-sent: long enough for Spirc to have
+/// handled the Seeked event, short enough to feel immediate.
+const SEEK_STATE_RESEND_DELAY: Duration = Duration::from_millis(500);
+
+/// Re-send the Connect state after the last of a run of seeks, matching the
+/// player's play/pause state so the re-send changes nothing but the position
+/// Spotify knows.
+fn spawn_seek_state_resend(
+  app: Arc<Mutex<App>>,
+  player: Arc<StreamingPlayer>,
+  seek_generation: Arc<AtomicU64>,
+  generation: u64,
+) {
+  tokio::spawn(async move {
+    tokio::time::sleep(SEEK_STATE_RESEND_DELAY).await;
+    if seek_generation.load(Ordering::Relaxed) != generation
+      || !is_current_streaming_player(&app, &player).await
+    {
+      return;
+    }
+    let playing = {
+      let app = app.lock().await;
+      if !app.native_context_should_drive() {
+        return;
+      }
+      app.native_is_playing
+    };
+    if let Some(playing) = playing {
+      info!("re-sending the connect state after a seek");
+      player.resend_connect_state(playing);
+    }
+  });
 }
 
 fn spawn_end_of_track_continuation(

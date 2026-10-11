@@ -1171,7 +1171,12 @@ fn render_local_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect, view: 
         .fg(app.user_config.theme.playbar_background.into())
         .add_modifier(modifier),
     )
-    .ratio(perc as f64 / 100.0)
+    // exact position instead of whole-percent steps, so the bar moves smoothly
+    .ratio(if view.live || view.duration_ms == 0 {
+      perc as f64 / 100.0
+    } else {
+      (view.position_ms as f64 / view.duration_ms as f64).clamp(0.0, 1.0)
+    })
     .filled_symbol(app.user_config.behavior.gauge_filled_icon.as_str())
     .unfilled_symbol(app.user_config.behavior.gauge_unfilled_icon.as_str())
     .label(Span::styled(
@@ -1510,7 +1515,12 @@ pub fn draw_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
             .fg(app.user_config.theme.playbar_background.into())
             .add_modifier(modifier),
         )
-        .ratio(perc as f64 / 100.0)
+        // exact position instead of whole-percent steps, so the bar moves smoothly
+        .ratio(if display_duration_ms == 0 {
+          perc as f64 / 100.0
+        } else {
+          (progress_ms as f64 / display_duration_ms as f64).clamp(0.0, 1.0)
+        })
         .filled_symbol(app.user_config.behavior.gauge_filled_icon.as_str())
         .unfilled_symbol(app.user_config.behavior.gauge_unfilled_icon.as_str())
         .label(Span::styled(

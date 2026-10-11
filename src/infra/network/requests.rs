@@ -16,6 +16,22 @@ static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// Longest rate-limit window honored, so a bad value cannot park the app.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
+/// A wait as people read it: `45s`, `9m 59s`, `21h 22m`, `1d 3h`.
+pub(crate) fn format_wait(secs: u64) -> String {
+  let (days, hours, minutes, seconds) = (
+    secs / 86_400,
+    secs % 86_400 / 3_600,
+    secs % 3_600 / 60,
+    secs % 60,
+  );
+  match secs {
+    0..=59 => format!("{seconds}s"),
+    60..=3_599 => format!("{minutes}m {seconds}s"),
+    3_600..=86_399 => format!("{hours}h {minutes}m"),
+    _ => format!("{days}d {hours}h"),
+  }
+}
+
 /// How long a 429 from the internal API holds every call back: librespot does
 /// not pass Spotify's `Retry-After` on.
 const ROUTED_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
@@ -397,8 +413,8 @@ fn rate_limited_error(left: Duration, endpoint: String) -> anyhow::Error {
   SpotifyApiError {
     status: StatusCode::TOO_MANY_REQUESTS,
     body: format!(
-      "rate limited by Spotify, retry in {}s",
-      left.as_secs().max(1)
+      "rate limited by Spotify, retry in {}",
+      format_wait(left.as_secs().max(1))
     ),
     detail: None,
     endpoint: Some(endpoint),
@@ -727,6 +743,14 @@ pub async fn spotify_get_typed_for<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn format_wait_reads_naturally_at_every_scale() {
+    assert_eq!(format_wait(17), "17s");
+    assert_eq!(format_wait(599), "9m 59s");
+    assert_eq!(format_wait(76_902), "21h 21m");
+    assert_eq!(format_wait(97_200), "1d 3h");
+  }
 
   /// The call sites are the part a unit test cannot otherwise reach: the
   /// redaction helpers are covered in isolation, but nothing would notice an

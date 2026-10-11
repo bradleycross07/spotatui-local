@@ -1,5 +1,4 @@
 use super::*;
-use crate::core::sort::Sorter;
 
 /// Playlist URIs with this scheme address the local YouTube playlists file.
 pub(crate) const YOUTUBE_PLAYLIST_PREFIX: &str = "youtube:playlist:";
@@ -533,17 +532,13 @@ impl App {
       return false;
     }
 
-    let mut all_tracks: Vec<TrackInfo> = Vec::new();
-    for page in &self.playlist_track_pages.pages {
-      for (_, item) in &page.items {
-        if let PlayableInfo::Track(track) = item {
-          all_tracks.push(track.clone());
-        }
-      }
-    }
-
-    Sorter::new(self.playlist_sort).sort_tracks(&mut all_tracks);
-    let _ = self.apply_sorted_playlist_tracks_if_current(playlist_id, all_tracks);
+    // Rebuilt from the pages, which sorts the rows together with their
+    // playlist positions: removing a track from the sorted view still removes
+    // the right one. A shown search result is replaced by the full list.
+    self.active_playlist_track_filter = None;
+    self.pending_playlist_track_search = None;
+    self.set_playlist_tracks_to_table_continuous();
+    self.view.track_table_index = 0;
     true
   }
 }
