@@ -1,5 +1,22 @@
 use super::*;
 
+/// Liked Songs in the chosen order. They arrive newest first, so each is
+/// numbered oldest-to-newest first: "Date Added" then means the same as in a
+/// playlist (ascending = oldest first) and Default keeps Spotify's order.
+fn sort_saved_tracks(tracks: Vec<TrackInfo>, sort_state: SortState) -> Vec<TrackInfo> {
+  if sort_state.field == SortField::Default {
+    return tracks;
+  }
+  let count = tracks.len();
+  let mut rows: Vec<(TrackInfo, usize)> = tracks
+    .into_iter()
+    .enumerate()
+    .map(|(index, track)| (track, count - 1 - index))
+    .collect();
+  super::playlist_pages::sort_playlist_track_matches(&mut rows, sort_state);
+  rows.into_iter().map(|(track, _)| track).collect()
+}
+
 /// Every sidebar row with what it needs; `App::library_rows` is the filtered list.
 pub(crate) fn library_row_requirements() -> &'static [(LibraryTarget, Requirement)] {
   &[
@@ -250,7 +267,20 @@ impl App {
     // Actually sort the data
     match context {
       SortContext::PlaylistTracks => {
-        if let Some(playlist_id) = self.current_playlist_track_table_id() {
+        if self.track_table.context == Some(TrackTableContext::SavedTracks) {
+          // Liked Songs: the loaded pages are re-sorted in memory. The menu
+          // always offered this here, but it used to change nothing.
+          self.set_saved_tracks_to_table_continuous();
+          self.view.track_table_index = 0;
+        } else if self.is_playlist_track_filter_active() {
+          // Sort the search results on screen rather than replacing them.
+          self.resort_shown_playlist_search_results();
+        } else if self.playlist_pages_loaded_completely() {
+          // Every page is in memory (a cached open, or a finished load):
+          // sort it here, with no request and no second download.
+          self.set_playlist_tracks_to_table_continuous();
+          self.view.track_table_index = 0;
+        } else if let Some(playlist_id) = self.current_playlist_track_table_id() {
           self.dispatch(IoEvent::FetchAllPlaylistTracksAndSort(
             playlist_id.id().to_string(),
           ));
@@ -416,6 +446,7 @@ impl App {
 
   pub fn set_saved_tracks_to_table_continuous(&mut self) {
     let (tracks, active_index, _) = self.saved_tracks_prefix();
+    let tracks = sort_saved_tracks(tracks, self.playlist_sort);
     self.library.saved_tracks.index = active_index;
     self.replace_track_table_tracks(tracks);
     self.track_table.context = Some(TrackTableContext::SavedTracks);
@@ -929,6 +960,239 @@ mod tests {
         Some("The current playback source cannot be liked")
       );
     }
+  }
+
+  fn track_by(id: &str, artist: &str) -> TrackInfo {
+    let mut track = TrackInfo::from(&full_track(id, id));
+    track.artists = vec![artist.to_string()];
+    track
+  }
+
+  fn names(app: &App) -> Vec<String> {
+    app
+      .track_table
+      .tracks
+      .iter()
+      .map(|t| t.name.clone())
+      .collect()
+  }
+
+  /// Liked Songs as Spotify returns them: newest first.
+  fn app_with_liked_songs() -> (App, std::sync::mpsc::Receiver<IoEvent>) {
+    let (tx, rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.library.saved_tracks.upsert_page_by_offset(Paged {
+      items: vec![
+        track_by("0000000000000000000003", "Charlie"),
+        track_by("0000000000000000000001", "alpha"),
+        track_by("0000000000000000000002", "Bravo"),
+      ],
+      offset: 0,
+      limit: 50,
+      total: 3,
+      next: None,
+      previous: None,
+    });
+    app.set_saved_tracks_to_table_continuous();
+    while rx.try_recv().is_ok() {}
+    (app, rx)
+  }
+
+  #[test]
+  fn sorting_liked_songs_reorders_them_in_memory_without_a_request() {
+    let (mut app, rx) = app_with_liked_songs();
+    app.view.track_table_index = 2;
+
+    app.apply_sort_field(SortContext::PlaylistTracks, SortField::Artist);
+
+    // Case-insensitive, like the playlist sort.
+    assert_eq!(
+      names(&app),
+      vec![
+        "0000000000000000000001",
+        "0000000000000000000002",
+        "0000000000000000000003"
+      ]
+    );
+    assert_eq!(app.view.track_table_index, 0);
+    assert!(
+      !matches!(rx.try_recv(), Ok(IoEvent::FetchAllPlaylistTracksAndSort(_))),
+      "Liked Songs never fetch a playlist to sort"
+    );
+
+    // Back to Default restores Spotify's order.
+    app.apply_sort_field(SortContext::PlaylistTracks, SortField::Default);
+    assert_eq!(names(&app)[0], "0000000000000000000003");
+  }
+
+  #[test]
+  fn liked_songs_date_added_ascending_puts_the_oldest_first() {
+    let (mut app, _rx) = app_with_liked_songs();
+    app.playlist_sort = SortState {
+      field: SortField::DateAdded,
+      order: SortOrder::Ascending,
+    };
+    app.set_saved_tracks_to_table_continuous();
+    // Spotify's newest-first list, reversed.
+    assert_eq!(
+      names(&app),
+      vec![
+        "0000000000000000000002",
+        "0000000000000000000001",
+        "0000000000000000000003"
+      ]
+    );
+  }
+
+  fn playlist_rows(offset: u32, rows: &[(&str, &str)], next: bool) -> Paged<(u32, PlayableInfo)> {
+    Paged {
+      items: rows
+        .iter()
+        .enumerate()
+        .map(|(i, (id, artist))| (offset + i as u32, PlayableInfo::Track(track_by(id, artist))))
+        .collect(),
+      offset,
+      limit: 2,
+      total: 4,
+      next: next.then(|| "next".to_string()),
+      previous: None,
+    }
+  }
+
+  fn app_with_open_playlist() -> (App, std::sync::mpsc::Receiver<IoEvent>) {
+    let (tx, rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    let id = PlaylistId::from_id("37i9dQZF1DX4WYpdgoIcn6")
+      .unwrap()
+      .into_static();
+    app.reset_playlist_tracks_view(id, TrackTableContext::MyPlaylists);
+    (app, rx)
+  }
+
+  #[test]
+  fn sorting_a_fully_loaded_playlist_needs_no_request_and_keeps_positions() {
+    let (mut app, rx) = app_with_open_playlist();
+    app
+      .playlist_track_pages
+      .upsert_page_by_offset(playlist_rows(
+        0,
+        &[
+          ("0000000000000000000001", "delta"),
+          ("0000000000000000000002", "Alpha"),
+        ],
+        true,
+      ));
+    app
+      .playlist_track_pages
+      .upsert_page_by_offset(playlist_rows(
+        2,
+        &[
+          ("0000000000000000000003", "charlie"),
+          ("0000000000000000000004", "Bravo"),
+        ],
+        false,
+      ));
+    app.set_playlist_tracks_to_table_continuous();
+    while rx.try_recv().is_ok() {}
+
+    app.apply_sort_field(SortContext::PlaylistTracks, SortField::Artist);
+
+    assert_eq!(
+      names(&app),
+      vec![
+        "0000000000000000000002",
+        "0000000000000000000004",
+        "0000000000000000000003",
+        "0000000000000000000001"
+      ]
+    );
+    // Each row still knows its place in the playlist (track removal uses it).
+    assert_eq!(app.playlist_track_positions, Some(vec![1, 3, 2, 0]));
+    assert!(
+      !matches!(rx.try_recv(), Ok(IoEvent::FetchAllPlaylistTracksAndSort(_))),
+      "a loaded playlist is sorted in memory"
+    );
+  }
+
+  #[test]
+  fn a_page_arriving_after_a_sort_lands_in_sort_order() {
+    let (mut app, rx) = app_with_open_playlist();
+    app
+      .playlist_track_pages
+      .upsert_page_by_offset(playlist_rows(
+        0,
+        &[
+          ("0000000000000000000001", "delta"),
+          ("0000000000000000000002", "Alpha"),
+        ],
+        true,
+      ));
+    app.set_playlist_tracks_to_table_continuous();
+
+    // Still loading: the sort falls back to fetching the whole playlist.
+    app.apply_sort_field(SortContext::PlaylistTracks, SortField::Artist);
+    let mut fetched = false;
+    while let Ok(event) = rx.try_recv() {
+      fetched |= matches!(event, IoEvent::FetchAllPlaylistTracksAndSort(_));
+    }
+    assert!(fetched);
+
+    // The open's next page arrives before that fetch answers.
+    app
+      .playlist_track_pages
+      .upsert_page_by_offset(playlist_rows(
+        2,
+        &[
+          ("0000000000000000000003", "charlie"),
+          ("0000000000000000000004", "Bravo"),
+        ],
+        false,
+      ));
+    app.set_playlist_tracks_to_table_continuous();
+
+    assert_eq!(
+      names(&app),
+      vec![
+        "0000000000000000000002",
+        "0000000000000000000004",
+        "0000000000000000000003",
+        "0000000000000000000001"
+      ]
+    );
+  }
+
+  #[test]
+  fn sorting_search_results_resorts_only_the_results() {
+    let (mut app, _rx) = app_with_open_playlist();
+    app
+      .playlist_track_pages
+      .upsert_page_by_offset(playlist_rows(
+        0,
+        &[
+          ("0000000000000000000001", "delta"),
+          ("0000000000000000000002", "Alpha"),
+        ],
+        false,
+      ));
+    app.set_playlist_tracks_to_table_continuous();
+    let id = app.playlist_track_table_id.clone().unwrap();
+    app.pending_playlist_track_search = Some("q".to_string());
+    assert!(app.apply_playlist_track_search_results(
+      &id,
+      "q".to_string(),
+      vec![
+        (track_by("0000000000000000000009", "zulu"), 7),
+        (track_by("0000000000000000000008", "Echo"), 5),
+      ],
+    ));
+
+    app.apply_sort_field(SortContext::PlaylistTracks, SortField::Artist);
+
+    assert_eq!(
+      names(&app),
+      vec!["0000000000000000000008", "0000000000000000000009"]
+    );
+    assert_eq!(app.playlist_track_positions, Some(vec![5, 7]));
   }
 
   #[test]

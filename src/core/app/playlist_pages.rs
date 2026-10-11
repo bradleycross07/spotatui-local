@@ -1,6 +1,9 @@
 use super::*;
 
-fn sort_playlist_track_matches(matches: &mut [(TrackInfo, usize)], sort_state: SortState) {
+pub(super) fn sort_playlist_track_matches(
+  matches: &mut [(TrackInfo, usize)],
+  sort_state: SortState,
+) {
   if sort_state.field == SortField::Default {
     return;
   }
@@ -28,9 +31,11 @@ fn sort_playlist_track_matches(matches: &mut [(TrackInfo, usize)], sort_state: S
 }
 
 impl App {
+  /// Rebuild the table from the loaded pages. While a search filter is shown
+  /// the table holds the search results, so a page arriving in the background
+  /// (the open-time prefetch chain) is kept in `playlist_track_pages` but must
+  /// not replace them; clearing the filter rebuilds from every loaded page.
   pub fn set_playlist_tracks_to_table_continuous(&mut self) {
-    // A late page must not replace the filtered rows; clearing the filter
-    // shows the pages again.
     if self.is_playlist_track_filter_active() {
       return;
     }
@@ -65,6 +70,17 @@ impl App {
         break;
       }
     }
+
+    // Keep the chosen sort while pages load: rows and their playlist
+    // positions are sorted together, so a late page lands in sort order and
+    // every row still knows where it sits in the playlist (removal uses it).
+    let (tracks, positions) = if self.playlist_sort.field == SortField::Default {
+      (tracks, positions)
+    } else {
+      let mut rows: Vec<(TrackInfo, usize)> = tracks.into_iter().zip(positions).collect();
+      sort_playlist_track_matches(&mut rows, self.playlist_sort);
+      rows.into_iter().unzip()
+    };
 
     self.playlist_track_pages.index = active_index;
     self.playlist_tracks = active_page;
@@ -205,6 +221,37 @@ impl App {
     self.track_table.tracks.clear();
     self.track_table.context = Some(context);
     self.playlist_track_positions = None;
+  }
+
+  /// Whether every page of the open playlist is loaded: contiguous from
+  /// offset 0 to a page with no `next`. A sort can then run on them in
+  /// memory instead of downloading the playlist again.
+  pub(crate) fn playlist_pages_loaded_completely(&self) -> bool {
+    let mut expected_offset = 0;
+    for page in &self.playlist_track_pages.pages {
+      if page.offset != expected_offset || page.limit == 0 {
+        return false;
+      }
+      if page.next.is_none() {
+        return true;
+      }
+      expected_offset = expected_offset.saturating_add(page.limit);
+    }
+    false
+  }
+
+  /// Re-sort the search results on screen in place, with their positions.
+  pub(crate) fn resort_shown_playlist_search_results(&mut self) {
+    let Some(positions) = self.playlist_track_positions.take() else {
+      return;
+    };
+    let tracks = std::mem::take(&mut self.track_table.tracks);
+    let mut rows: Vec<(TrackInfo, usize)> = tracks.into_iter().zip(positions).collect();
+    sort_playlist_track_matches(&mut rows, self.playlist_sort);
+    let (tracks, positions): (Vec<TrackInfo>, Vec<usize>) = rows.into_iter().unzip();
+    self.track_table.tracks = tracks;
+    self.playlist_track_positions = Some(positions);
+    self.view.track_table_index = 0;
   }
 
   pub fn is_playlist_track_filter_active(&self) -> bool {
@@ -681,6 +728,45 @@ mod tests {
       }
       _ => panic!("unexpected event"),
     }
+  }
+
+  #[test]
+  fn a_background_page_does_not_overwrite_shown_search_results() {
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    let playlist_id = playlist_id("37i9dQZF1DX4WYpdgoIcn6");
+
+    app.track_table.context = Some(TrackTableContext::MyPlaylists);
+    app.playlist_track_table_id = Some(playlist_id.clone());
+    app.pending_playlist_track_search = Some("second".to_string());
+    assert!(app.apply_playlist_track_search_results(
+      &playlist_id,
+      "second".to_string(),
+      vec![(track_info("0000000000000000000002", "Second"), 1)],
+    ));
+
+    // A prefetch page lands while the results are shown.
+    app
+      .playlist_track_pages
+      .upsert_page_by_offset(playlist_page(
+        0,
+        3,
+        &[
+          "0000000000000000000001",
+          "0000000000000000000002",
+          "0000000000000000000003",
+        ],
+        false,
+      ));
+    app.set_playlist_tracks_to_table_continuous();
+
+    assert_eq!(app.track_table.tracks.len(), 1, "results must stay");
+    assert_eq!(app.track_table.tracks[0].name, "Second");
+    assert_eq!(app.playlist_track_positions, Some(vec![1]));
+
+    // Clearing the filter shows every page that loaded meanwhile.
+    app.clear_playlist_track_filter();
+    assert_eq!(app.track_table.tracks.len(), 3);
   }
 
   #[test]

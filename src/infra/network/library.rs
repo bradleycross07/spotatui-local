@@ -229,6 +229,340 @@ enum PlaylistTracksPage {
   Librespot(Paged<(u32, PlayableInfo)>),
 }
 
+/// Page size for whole-playlist walks (search and sort): the API maximum,
+/// independent of terminal height.
+const PLAYLIST_WALK_PAGE_LIMIT: u32 = 50;
+/// Pages in flight at once during a whole-playlist walk. Every request still
+/// passes the shared `Retry-After` gate, so a 429 pauses all of them together.
+const PLAYLIST_WALK_CONCURRENCY: usize = 6;
+
+/// Minimum spacing between page requests of whole-playlist walks: 2 per
+/// second, half the 4/s global pacing. Applies to every walk, including
+/// playlists read through the librespot fallback, where each page fans out
+/// into one metadata lookup per track on the user's own session every Spotify call already obeys.
+/// Walks are the app's only long bursts of requests, and running them at the
+/// global ceiling for their whole duration triggered Spotify's rate limit
+/// (which then blocks every API call for minutes). Interactive requests keep
+/// the global pace; only bulk walks slow down.
+const PLAYLIST_WALK_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A burst-free pacer: each `wait` starts at least `interval` after the
+/// previous one's slot. Slots are reserved under the lock and slept on outside
+/// it, so concurrent waiters queue in order without serializing their sleeps.
+struct WalkPacer {
+  interval: Duration,
+  next_slot: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl WalkPacer {
+  fn new(interval: Duration) -> Self {
+    Self {
+      interval,
+      next_slot: Mutex::new(None),
+    }
+  }
+
+  async fn wait(&self) {
+    let start_at = {
+      let mut next_slot = self.next_slot.lock().await;
+      let now = tokio::time::Instant::now();
+      // Clamp to `now` so idle time banks no credit: no bursts after a pause.
+      let slot = next_slot.map_or(now, |slot| slot.max(now));
+      *next_slot = Some(slot + self.interval);
+      slot
+    };
+    tokio::time::sleep_until(start_at).await;
+  }
+}
+
+/// One pacer shared by every walk, so a search and a sort running at the same
+/// time still total 2 requests per second.
+/// Pacer for background heart lookups: one request a second.
+fn liked_lookup_pacer() -> &'static WalkPacer {
+  static PACER: std::sync::OnceLock<WalkPacer> = std::sync::OnceLock::new();
+  PACER.get_or_init(|| WalkPacer::new(Duration::from_secs(1)))
+}
+
+fn playlist_walk_pacer() -> &'static WalkPacer {
+  static PACER: std::sync::OnceLock<WalkPacer> = std::sync::OnceLock::new();
+  PACER.get_or_init(|| WalkPacer::new(PLAYLIST_WALK_MIN_INTERVAL))
+}
+
+/// The lock serializing walks of one playlist. Entries are held weakly, so a
+/// playlist's lock is freed once no walk holds it, and dead entries are pruned
+/// whenever a new one is created, keeping the map as small as the walks in use.
+fn playlist_walk_lock(playlist_id: &str) -> Arc<Mutex<()>> {
+  use std::sync::{Mutex as StdMutex, OnceLock, Weak};
+  static LOCKS: OnceLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+
+  let mut locks = LOCKS
+    .get_or_init(Default::default)
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some(lock) = locks.get(playlist_id).and_then(Weak::upgrade) {
+    return lock;
+  }
+  locks.retain(|_, lock| lock.strong_count() > 0);
+  let lock = Arc::new(Mutex::new(()));
+  locks.insert(playlist_id.to_string(), Arc::downgrade(&lock));
+  lock
+}
+
+/// Fetch every item of a playlist, in order, with their raw positions.
+///
+/// Page one is fetched alone to learn the total and the page size the server
+/// actually honored; the remaining pages are then requested concurrently
+/// (`buffered` keeps them in playlist order). Replaces the one-page-at-a-time
+/// walk, whose cost grew linearly in round trips with playlist length.
+async fn fetch_all_playlist_items(
+  spotify: &AuthCodePkceSpotify,
+  app: &Arc<Mutex<App>>,
+  token_cache_path: &Path,
+  playlist_id: &PlaylistId<'_>,
+  fallbacks: &ExternalPlaylistFallbackCache,
+) -> Result<Vec<(u32, PlayableInfo)>, PlaylistPageError> {
+  let id = playlist_id.id().to_string();
+  let cache_dir = super::playlist_cache::default_dir();
+
+  // One walk per playlist at a time. A second search or sort of the same
+  // playlist waits here for the running walk, then finds its result in the
+  // cache below instead of fetching every page again. Without this, typing
+  // a few searches into an uncached playlist ran one full walk per search.
+  let walk_lock = playlist_walk_lock(&id);
+  let _walk_guard = walk_lock.lock().await;
+
+  // Playlists already classified external are served by the librespot
+  // fallback; the Web API would only 403 the snapshot request, so skip it.
+  let known_external = fallbacks.lock().await.is_external(&id);
+  let snapshot_id = match &cache_dir {
+    Some(_) if !known_external => {
+      fetch_playlist_snapshot_id(spotify, app, token_cache_path, &id).await
+    }
+    _ => None,
+  };
+
+  if let (Some(dir), Some(snapshot)) = (&cache_dir, &snapshot_id) {
+    let (dir, load_id, snapshot) = (dir.clone(), id.clone(), snapshot.clone());
+    let cached =
+      tokio::task::spawn_blocking(move || super::playlist_cache::load(&dir, &load_id, &snapshot))
+        .await
+        .ok()
+        .flatten();
+    if let Some(items) = cached {
+      log::debug!("playlist cache: hit for {id} ({} items)", items.len());
+      return Ok(items);
+    }
+  }
+
+  let items =
+    fetch_all_playlist_items_uncached(spotify, app, token_cache_path, playlist_id, fallbacks)
+      .await?;
+
+  // Record under the snapshot read *before* the walk: if the playlist changed
+  // mid-walk, the stored snapshot is already stale and the next use refetches,
+  // so a race can cost one extra walk but never serve outdated contents. The
+  // write finishes before the walk lock is released, so a caller waiting on
+  // the lock is guaranteed to find the entry.
+  if let (Some(dir), Some(snapshot)) = (cache_dir, snapshot_id) {
+    let to_store = items.clone();
+    let stored = tokio::task::spawn_blocking(move || {
+      super::playlist_cache::store(&dir, &id, &snapshot, &to_store).map_err(|error| (id, error))
+    })
+    .await;
+    if let Ok(Err((id, error))) = stored {
+      log::warn!("playlist cache: could not store {id}: {error}");
+    }
+  }
+
+  Ok(items)
+}
+
+/// How an open went with the disk cache.
+enum CachedOpen {
+  /// The playlist came from the cache (or the open was superseded meanwhile).
+  Served,
+  /// Load from the network; `snapshot_id`, when known, lets the page chain
+  /// store the result.
+  Miss { snapshot_id: Option<String> },
+}
+
+/// Page size for pages rebuilt from the disk cache (the Web API maximum).
+const CACHED_PAGE_LIMIT: u32 = 50;
+
+/// Rebuild the playlist page cache from a whole cached playlist, as the pages
+/// an open would have downloaded: one page per `CACHED_PAGE_LIMIT` raw
+/// positions, contiguous from offset 0, `next` set on all but the last. A page
+/// whose positions were all removed tracks is kept empty so the chain of
+/// offsets stays unbroken (the continuous table rebuild stops at a gap).
+fn pages_from_cached_items(items: Vec<(u32, PlayableInfo)>) -> Vec<Paged<(u32, PlayableInfo)>> {
+  let total = items
+    .iter()
+    .map(|(position, _)| position.saturating_add(1))
+    .max()
+    .unwrap_or(0);
+  let page_count = total.div_ceil(CACHED_PAGE_LIMIT).max(1);
+  let mut pages: Vec<Paged<(u32, PlayableInfo)>> = (0..page_count)
+    .map(|index| Paged {
+      items: Vec::new(),
+      offset: index * CACHED_PAGE_LIMIT,
+      limit: CACHED_PAGE_LIMIT,
+      total,
+      next: (index + 1 < page_count).then(|| "spotatui:playlist-cache:next".to_string()),
+      previous: None,
+    })
+    .collect();
+  for (position, item) in items {
+    if let Some(page) = pages.get_mut((position / CACHED_PAGE_LIMIT) as usize) {
+      page.items.push((position, item));
+    }
+  }
+  pages
+}
+
+/// Every item of a playlist, when `pages` (sorted by offset, as the page cache
+/// keeps them) cover it from offset 0 to a page with no `next`, with no gap
+/// between consecutive pages. `None` for anything partial, so an interrupted
+/// load is never stored as if it were the whole playlist.
+fn complete_playlist_items(
+  pages: &[Paged<(u32, PlayableInfo)>],
+) -> Option<Vec<(u32, PlayableInfo)>> {
+  let mut expected_offset = 0u32;
+  let mut items = Vec::new();
+  for page in pages {
+    if page.offset != expected_offset || page.limit == 0 {
+      return None;
+    }
+    items.extend(page.items.iter().cloned());
+    if page.next.is_none() {
+      return Some(items);
+    }
+    expected_offset = expected_offset.checked_add(page.limit)?;
+  }
+  None
+}
+
+/// Store a playlist the open-time page chain finished loading, if its pages
+/// are complete. Called with the `snapshot_id` read before the first page, so
+/// a playlist edited mid-load is stored under a stale tag and refetched next
+/// time rather than served out of date.
+fn store_completed_playlist(
+  pages: &[Paged<(u32, PlayableInfo)>],
+  playlist_id: &PlaylistId<'_>,
+  snapshot_id: Option<&str>,
+) {
+  let (Some(snapshot), Some(dir)) = (snapshot_id, super::playlist_cache::default_dir()) else {
+    return;
+  };
+  let Some(items) = complete_playlist_items(pages) else {
+    return;
+  };
+  let (id, snapshot) = (playlist_id.id().to_string(), snapshot.to_string());
+  tokio::task::spawn_blocking(move || {
+    match super::playlist_cache::store(&dir, &id, &snapshot, &items) {
+      Ok(()) => log::debug!(
+        "playlist cache: stored {id} from open ({} items)",
+        items.len()
+      ),
+      Err(error) => log::warn!("playlist cache: could not store {id}: {error}"),
+    }
+  });
+}
+
+/// The playlist's current `snapshot_id` (one request, `fields`-filtered so the
+/// response is a few bytes), or `None` when it cannot be read; callers then
+/// bypass the cache instead of failing.
+async fn fetch_playlist_snapshot_id(
+  spotify: &AuthCodePkceSpotify,
+  app: &Arc<Mutex<App>>,
+  token_cache_path: &Path,
+  playlist_id: &str,
+) -> Option<String> {
+  #[derive(serde::Deserialize)]
+  struct PlaylistSnapshot {
+    snapshot_id: String,
+  }
+
+  match spotify_get_typed_compat_for_with_refresh::<PlaylistSnapshot>(
+    spotify,
+    &format!("playlists/{playlist_id}"),
+    &[("fields", "snapshot_id".to_string())],
+    token_cache_path,
+    app,
+  )
+  .await
+  {
+    Ok(snapshot) if !snapshot.snapshot_id.is_empty() => Some(snapshot.snapshot_id),
+    Ok(_) => None,
+    Err(error) => {
+      log::debug!("playlist cache: no snapshot_id for {playlist_id}, bypassing cache: {error}");
+      None
+    }
+  }
+}
+
+/// The network walk behind [`fetch_all_playlist_items`].
+async fn fetch_all_playlist_items_uncached(
+  spotify: &AuthCodePkceSpotify,
+  app: &Arc<Mutex<App>>,
+  token_cache_path: &Path,
+  playlist_id: &PlaylistId<'_>,
+  fallbacks: &ExternalPlaylistFallbackCache,
+) -> Result<Vec<(u32, PlayableInfo)>, PlaylistPageError> {
+  use futures::stream::{self, StreamExt, TryStreamExt};
+
+  playlist_walk_pacer().wait().await;
+  let first = fetch_playlist_tracks_page(
+    spotify,
+    app,
+    token_cache_path,
+    playlist_id,
+    0,
+    PLAYLIST_WALK_PAGE_LIMIT,
+    fallbacks,
+  )
+  .await?
+  .into_domain();
+
+  // Same continuation rules as the sequential walk: no `next` (or a zero
+  // limit) means this was the only page.
+  if playlist_page_next_offset(&first, 0).is_none() {
+    return Ok(first.items);
+  }
+
+  // Step by the limit the server reported, so a server-side cap below the
+  // requested limit cannot leave gaps between pages.
+  let step = first.limit;
+  let total = first.total;
+  let mut items = first.items;
+  let offsets: Vec<u32> = std::iter::successors(Some(step), |offset| offset.checked_add(step))
+    .take_while(|offset| *offset < total)
+    .collect();
+
+  let pages: Vec<Paged<(u32, PlayableInfo)>> = stream::iter(offsets)
+    .map(|offset| async move {
+      playlist_walk_pacer().wait().await;
+      fetch_playlist_tracks_page(
+        spotify,
+        app,
+        token_cache_path,
+        playlist_id,
+        offset,
+        step,
+        fallbacks,
+      )
+      .await
+      .map(PlaylistTracksPage::into_domain)
+    })
+    .buffered(PLAYLIST_WALK_CONCURRENCY)
+    .try_collect()
+    .await?;
+
+  for page in pages {
+    items.extend(page.items);
+  }
+  Ok(items)
+}
+
 impl PlaylistTracksPage {
   fn into_domain(self) -> Paged<(u32, PlayableInfo)> {
     match self {
@@ -661,6 +995,14 @@ fn populate_liked_song_ids_from_saved_tracks(
       liked_song_ids_set.insert(track_id.id().to_string());
     }
   }
+  // Every track in Liked Songs is liked: free answers for the heart cache.
+  super::liked_cache::record_all(
+    page
+      .items
+      .iter()
+      .filter_map(|item| item.track.id.as_ref())
+      .map(|id| (id.id(), true)),
+  );
 }
 
 fn playlist_track_search_terms(query: &str) -> Vec<String> {
@@ -695,6 +1037,106 @@ fn domain_track_page(
   }
 }
 
+/// Newest songs that key the Liked Songs cache. Fixed rather than the whole
+/// first page, whose size follows the terminal height: resizing the window
+/// must not invalidate the cache. A like always lands on top, so the newest
+/// few are enough to see it.
+const LIKED_SONGS_KEY_HEAD: usize = 10;
+
+/// The cache key of Liked Songs as its first page describes it.
+fn liked_songs_key(first_page: &Page<SavedTrack>) -> super::liked_songs_cache::LikedSongsKey {
+  super::liked_songs_cache::LikedSongsKey {
+    total: first_page.total,
+    head_ids: first_page
+      .items
+      .iter()
+      .take(LIKED_SONGS_KEY_HEAD)
+      .map(|item| {
+        item
+          .track
+          .id
+          .as_ref()
+          .map(|id| id.id().to_string())
+          .unwrap_or_default()
+      })
+      .collect(),
+  }
+}
+
+async fn load_liked_songs(key: super::liked_songs_cache::LikedSongsKey) -> Option<Vec<TrackInfo>> {
+  let path = super::liked_songs_cache::default_path()?;
+  tokio::task::spawn_blocking(move || super::liked_songs_cache::load(&path, &key))
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Rebuild the Liked Songs page cache from the first page just fetched and
+/// the cached whole list: the remaining pages use the first page's size, so
+/// offsets stay contiguous (the table rebuild stops at a gap).
+fn saved_track_pages_from_cache(
+  first_page: Paged<TrackInfo>,
+  tracks: Vec<TrackInfo>,
+) -> Vec<Paged<TrackInfo>> {
+  let limit = first_page.limit.max(1) as usize;
+  let total = tracks.len() as u32;
+  let rest: Vec<TrackInfo> = tracks.into_iter().skip(first_page.items.len()).collect();
+  let mut pages = vec![Paged {
+    total,
+    next: (!rest.is_empty()).then(|| "spotatui:liked-songs-cache:next".to_string()),
+    ..first_page
+  }];
+  let chunks: Vec<Vec<TrackInfo>> = rest.chunks(limit).map(<[TrackInfo]>::to_vec).collect();
+  let count = chunks.len();
+  for (index, items) in chunks.into_iter().enumerate() {
+    pages.push(Paged {
+      items,
+      offset: ((index + 1) * limit) as u32,
+      limit: limit as u32,
+      total,
+      next: (index + 1 < count).then(|| "spotatui:liked-songs-cache:next".to_string()),
+      previous: None,
+    });
+  }
+  pages
+}
+
+/// Show Liked Songs from the cache: every page at once, every heart known.
+fn apply_cached_liked_songs(app: &mut App, first_page: Paged<TrackInfo>, tracks: Vec<TrackInfo>) {
+  let count = tracks.len();
+  let ids: Vec<String> = tracks.iter().filter_map(|track| track.id.clone()).collect();
+  super::liked_cache::record_all(ids.iter().map(|id| (id.as_str(), true)));
+  app.liked_song_ids_set_mut().extend(ids);
+  for page in saved_track_pages_from_cache(first_page, tracks) {
+    app.saved_tracks_mut().upsert_page_by_offset(page);
+  }
+  app.set_saved_tracks_to_table_continuous();
+  app
+    .plugin_data_generations
+    .bump(crate::core::app::PluginDataKind::SavedTracks);
+  log::debug!("liked songs cache: opened from cache ({count} songs)");
+}
+
+/// Store Liked Songs when every page is loaded, under the key read from the
+/// first page of this open. A list edited mid-load is stored under a stale
+/// key and refetched next time, never served out of date.
+fn store_liked_songs_if_complete(app: &App, key: Option<&super::liked_songs_cache::LikedSongsKey>) {
+  let (Some(key), Some(path)) = (key, super::liked_songs_cache::default_path()) else {
+    return;
+  };
+  let (tracks, _, has_more) = app.saved_tracks_prefix();
+  if has_more || tracks.len() != key.total as usize {
+    return;
+  }
+  let key = key.clone();
+  tokio::task::spawn_blocking(move || {
+    match super::liked_songs_cache::store(&path, &key, &tracks) {
+      Ok(()) => log::debug!("liked songs cache: stored {} songs", tracks.len()),
+      Err(error) => log::warn!("liked songs cache: could not store: {error}"),
+    }
+  });
+}
+
 pub async fn prefetch_saved_tracks_page_task(
   spotify: AuthCodePkceSpotify,
   app: Arc<Mutex<App>>,
@@ -702,6 +1144,7 @@ pub async fn prefetch_saved_tracks_page_task(
   limit: u32,
   mut offset: u32,
   generation: u64,
+  key: Option<super::liked_songs_cache::LikedSongsKey>,
 ) {
   loop {
     let should_fetch = {
@@ -755,6 +1198,8 @@ pub async fn prefetch_saved_tracks_page_task(
       .upsert_page_by_offset(domain_page);
     app_guard.set_saved_tracks_to_table_continuous();
     let Some(candidate_next_offset) = next_offset else {
+      // The last page landed: store the whole list if nothing is missing.
+      store_liked_songs_if_complete(&app_guard, key.as_ref());
       return;
     };
     let should_prefetch_next = app_guard
@@ -787,6 +1232,7 @@ pub async fn prefetch_playlist_tracks_page_task(
   mut offset: u32,
   generation: u64,
   fallbacks: ExternalPlaylistFallbackCache,
+  snapshot_id: Option<String>,
 ) {
   loop {
     let should_fetch = {
@@ -848,6 +1294,12 @@ pub async fn prefetch_playlist_tracks_page_task(
     app_guard.playlist_track_pages.upsert_page_by_offset(page);
     app_guard.set_playlist_tracks_to_table_continuous();
     let Some(candidate_next_offset) = next_offset else {
+      // The last page landed: store the playlist if every page is present.
+      store_completed_playlist(
+        &app_guard.playlist_track_pages.pages,
+        &playlist_id,
+        snapshot_id.as_deref(),
+      );
       return;
     };
     let should_prefetch_next = app_guard
@@ -955,6 +1407,19 @@ impl Network {
   }
 
   pub(super) async fn library_save_uris(&self, uris: &[String]) -> anyhow::Result<()> {
+    self.library_save_uris_inner(uris).await?;
+    // Spotify accepted the like: remember it so the heart cache cannot
+    // show the old state on the next open.
+    super::liked_cache::record_all(
+      super::liked_cache::track_ids_of_uris(uris)
+        .into_iter()
+        .map(|id| (id, true)),
+    );
+    super::liked_cache::save_in_background();
+    Ok(())
+  }
+
+  async fn library_save_uris_inner(&self, uris: &[String]) -> anyhow::Result<()> {
     for batch in uri_batches(uris) {
       let query = vec![("uris", batch.join(","))];
       spotify_api_request_json_for_with_refresh(
@@ -972,6 +1437,17 @@ impl Network {
   }
 
   pub(super) async fn library_remove_uris(&self, uris: &[String]) -> anyhow::Result<()> {
+    self.library_remove_uris_inner(uris).await?;
+    super::liked_cache::record_all(
+      super::liked_cache::track_ids_of_uris(uris)
+        .into_iter()
+        .map(|id| (id, false)),
+    );
+    super::liked_cache::save_in_background();
+    Ok(())
+  }
+
+  async fn library_remove_uris_inner(&self, uris: &[String]) -> anyhow::Result<()> {
     for batch in uri_batches(uris) {
       let query = vec![("uris", batch.join(","))];
       spotify_api_request_json_for_with_refresh(
@@ -988,7 +1464,12 @@ impl Network {
     Ok(())
   }
 
-  pub fn spawn_saved_tracks_prefetch(&self, offset: u32, generation: u64) {
+  pub fn spawn_saved_tracks_prefetch(
+    &self,
+    offset: u32,
+    generation: u64,
+    key: Option<super::liked_songs_cache::LikedSongsKey>,
+  ) {
     let spotify = self.spotify().clone();
     let app = self.app.clone();
     let token_cache_path = self.token_cache_path.clone();
@@ -1001,6 +1482,7 @@ impl Network {
         large_search_limit,
         offset,
         generation,
+        key,
       )
       .await;
     });
@@ -1011,6 +1493,7 @@ impl Network {
     playlist_id: PlaylistId<'static>,
     offset: u32,
     generation: u64,
+    snapshot_id: Option<String>,
   ) {
     let spotify = self.spotify().clone();
     let app = self.app.clone();
@@ -1027,9 +1510,69 @@ impl Network {
         offset,
         generation,
         fallbacks,
+        snapshot_id,
       )
       .await;
     });
+  }
+
+  /// Serve a playlist open from the disk cache, if it holds this playlist
+  /// under its current `snapshot_id`. Playlists read through the librespot
+  /// fallback have no tag the Web API will give out, so they always miss.
+  async fn open_playlist_from_cache(
+    &self,
+    playlist_id: &PlaylistId<'static>,
+    generation: u64,
+  ) -> CachedOpen {
+    let id = playlist_id.id().to_string();
+    let Some(dir) = super::playlist_cache::default_dir() else {
+      return CachedOpen::Miss { snapshot_id: None };
+    };
+    if self
+      .external_playlist_fallbacks
+      .lock()
+      .await
+      .is_external(&id)
+    {
+      return CachedOpen::Miss { snapshot_id: None };
+    }
+    let Some(snapshot_id) =
+      fetch_playlist_snapshot_id(self.spotify(), &self.app, &self.token_cache_path, &id).await
+    else {
+      return CachedOpen::Miss { snapshot_id: None };
+    };
+
+    let (load_dir, load_id, load_snapshot) = (dir, id.clone(), snapshot_id.clone());
+    let cached = tokio::task::spawn_blocking(move || {
+      super::playlist_cache::load(&load_dir, &load_id, &load_snapshot)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(items) = cached else {
+      return CachedOpen::Miss {
+        snapshot_id: Some(snapshot_id),
+      };
+    };
+
+    let item_count = items.len();
+    let pages = pages_from_cached_items(items);
+    let mut app = self.app.lock().await;
+    if app.pending_playlist_open.as_deref() == Some(id.as_str()) {
+      app.pending_playlist_open = None;
+    }
+    // Same guard as a page from the network: a newer open or another table
+    // replaced this one while the cache was read.
+    if app.playlist_tracks_prefetch_generation == generation
+      && app.is_playlist_track_table_active_for(playlist_id)
+    {
+      for page in pages {
+        app.playlist_track_pages.upsert_page_by_offset(page);
+      }
+      app.set_playlist_tracks_to_table_continuous();
+      log::debug!("playlist cache: opened {id} from cache ({item_count} items)");
+    }
+    CachedOpen::Served
   }
 }
 
@@ -1051,11 +1594,16 @@ async fn liked_lookup_worker_task(
   const BATCH: usize = 40;
   const MAX_CONSECUTIVE_FAILURES: u32 = 3;
   let mut consecutive_failures = 0u32;
+  let mut learned_any = false;
   loop {
     let (batch, epoch) = {
       let mut guard = app.lock().await;
       if guard.liked_lookup_pending.is_empty() {
         guard.liked_lookup_worker_running = false;
+        drop(guard);
+        if learned_any {
+          super::liked_cache::save_in_background();
+        }
         return;
       }
       let batch: Vec<String> = guard
@@ -1073,6 +1621,9 @@ async fn liked_lookup_worker_task(
       .iter()
       .map(|id| format!("spotify:track:{id}"))
       .collect();
+    // Hearts are cosmetic: at most one lookup a second, so a large table can
+    // never crowd out what the user is doing.
+    liked_lookup_pacer().wait().await;
     let result = spotify_get_typed_compat_for_with_refresh::<Vec<bool>>(
       &spotify,
       "me/library/contains",
@@ -1091,6 +1642,13 @@ async fn liked_lookup_worker_task(
           guard.liked_lookup_pending.extend(batch);
           continue;
         }
+        super::liked_cache::record_all(
+          batch
+            .iter()
+            .zip(&is_saved_vec)
+            .map(|(id, liked)| (id.as_str(), *liked)),
+        );
+        learned_any = true;
         for (i, id) in batch.into_iter().enumerate() {
           match is_saved_vec.get(i) {
             Some(true) => {
@@ -1127,10 +1685,6 @@ async fn liked_lookup_worker_task(
   }
 }
 
-/// Pages one playlist-track search reads at most: Spotify's playlist limit.
-const PLAYLIST_SEARCH_MAX_PAGES: u32 = 200;
-const PLAYLIST_SEARCH_PAGE_SIZE: u32 = 50;
-
 struct PlaylistTrackSearch {
   spotify: AuthCodePkceSpotify,
   app: Arc<Mutex<App>>,
@@ -1141,6 +1695,9 @@ struct PlaylistTrackSearch {
   query: String,
 }
 
+/// Background half of `search_playlist_tracks`. Walks the playlist through the
+/// disk cache (`fetch_all_playlist_items`), so a repeat search is fast; results
+/// apply only while this search is still the current one.
 async fn search_playlist_tracks_task(search: PlaylistTrackSearch, terms: Vec<String>) {
   let PlaylistTrackSearch {
     spotify,
@@ -1151,85 +1708,48 @@ async fn search_playlist_tracks_task(search: PlaylistTrackSearch, terms: Vec<Str
     playlist_id,
     query,
   } = search;
-  let mut offset = 0u32;
-  let mut matches: Vec<(TrackInfo, usize)> = Vec::new();
-  let mut capped = false;
 
-  for page_number in 0.. {
-    if !app
-      .lock()
-      .await
-      .playlist_track_search_is_current(&playlist_id, &query)
-    {
-      return;
-    }
-    if page_number == PLAYLIST_SEARCH_MAX_PAGES {
-      capped = true;
-      break;
-    }
+  let result =
+    fetch_all_playlist_items(&spotify, &app, &token_cache_path, &playlist_id, &fallbacks).await;
 
-    let page = match fetch_playlist_tracks_page(
-      &spotify,
-      &app,
-      &token_cache_path,
-      &playlist_id,
-      offset,
-      PLAYLIST_SEARCH_PAGE_SIZE,
-      &fallbacks,
-    )
-    .await
-    {
-      Ok(page) => page.into_domain(),
-      Err(error) => {
-        let mut app = app.lock().await;
-        if !app.fail_playlist_track_search(&playlist_id, &query) {
-          return;
-        }
-        match error {
-          PlaylistPageError::UnsupportedExternal => {
-            app.set_error_status_message(EXTERNAL_PLAYLIST_UNAVAILABLE_STATUS, 8);
-          }
-          // A rate limit is a wait, not a failure page: the pump shows it the
-          // same way.
-          PlaylistPageError::Request(error) if is_rate_limited_error(&error) => {
-            app.set_error_status_message(with_rate_limit_hint(error, &client_id).to_string(), 8);
-          }
-          PlaylistPageError::Request(error) => app.handle_error(error),
-        }
-        return;
-      }
-    };
-
-    // See the sort walk: only `next` stops pagination, never the compacted
-    // item count.
-    let next_offset = playlist_page_next_offset(&page, offset);
-    for (position, item) in page.items {
-      if let PlayableInfo::Track(track) = item {
-        if playlist_track_info_matches_terms(&track, &terms) {
-          matches.push((track, position as usize));
-        }
-      }
-    }
-
-    let Some(next_offset) = next_offset else {
-      break;
-    };
-    offset = next_offset;
+  let mut app = app.lock().await;
+  if !app.playlist_track_search_is_current(&playlist_id, &query) {
+    return;
   }
 
+  let items = match result {
+    Ok(items) => items,
+    Err(error) => {
+      if !app.fail_playlist_track_search(&playlist_id, &query) {
+        return;
+      }
+      match error {
+        PlaylistPageError::UnsupportedExternal => {
+          app.set_error_status_message(EXTERNAL_PLAYLIST_UNAVAILABLE_STATUS, 8);
+        }
+        PlaylistPageError::Request(error) if is_rate_limited_error(&error) => {
+          app.set_error_status_message(with_rate_limit_hint(error, &client_id).to_string(), 8);
+        }
+        PlaylistPageError::Request(error) => app.handle_error(error),
+      }
+      return;
+    }
+  };
+
+  let matches: Vec<(TrackInfo, usize)> = items
+    .into_iter()
+    .filter_map(|(position, item)| match item {
+      PlayableInfo::Track(track) if playlist_track_info_matches_terms(&track, &terms) => {
+        Some((track, position as usize))
+      }
+      _ => None,
+    })
+    .collect();
+
   let match_count = matches.len();
-  let mut app = app.lock().await;
   if app.apply_playlist_track_search_results(&playlist_id, query.clone(), matches) {
-    let scope = if capped {
-      format!(
-        " in the first {} tracks",
-        PLAYLIST_SEARCH_MAX_PAGES * PLAYLIST_SEARCH_PAGE_SIZE
-      )
-    } else {
-      String::new()
-    };
     app.set_status_message(
-      format!("{match_count} playlist tracks match \"{query}\"{scope}"),
+      format!("{match_count} playlist tracks match \"{query}\""),
       3,
     );
   }
@@ -1243,33 +1763,22 @@ async fn fetch_all_playlist_tracks_and_sort_task(
   fallbacks: ExternalPlaylistFallbackCache,
 ) {
   let playlist_id_string = playlist_id.id().to_string();
-  let mut all_tracks: Vec<TrackInfo> = Vec::new();
-  let mut offset = 0u32;
-  let limit = 50u32;
 
-  loop {
-    {
-      let mut app = app.lock().await;
-      if !app.is_playlist_track_table_active_for(&playlist_id) {
-        app
-          .playlist_sort_fetch_in_flight
-          .remove(&playlist_id_string);
-        return;
-      }
+  {
+    let mut app = app.lock().await;
+    if !app.is_playlist_track_table_active_for(&playlist_id) {
+      app
+        .playlist_sort_fetch_in_flight
+        .remove(&playlist_id_string);
+      return;
     }
+  }
 
-    let page = match fetch_playlist_tracks_page(
-      &spotify,
-      &app,
-      &token_cache_path,
-      &playlist_id,
-      offset,
-      limit,
-      &fallbacks,
-    )
-    .await
+  let items =
+    match fetch_all_playlist_items(&spotify, &app, &token_cache_path, &playlist_id, &fallbacks)
+      .await
     {
-      Ok(page) => page.into_domain(),
+      Ok(items) => items,
       Err(PlaylistPageError::UnsupportedExternal) => {
         let mut app = app.lock().await;
         app
@@ -1288,21 +1797,13 @@ async fn fetch_all_playlist_tracks_and_sort_task(
       }
     };
 
-    // A compacted page may hold zero domain items while `next` still
-    // promises more raw slots, so only the continuation metadata stops the
-    // walk. The zero-limit guard lives in `playlist_page_next_offset`.
-    let next_offset = playlist_page_next_offset(&page, offset);
-    for (_, item) in page.items {
-      if let PlayableInfo::Track(track) = item {
-        all_tracks.push(track);
-      }
-    }
-
-    let Some(next_offset) = next_offset else {
-      break;
-    };
-    offset = next_offset;
-  }
+  let mut all_tracks: Vec<TrackInfo> = items
+    .into_iter()
+    .filter_map(|(_, item)| match item {
+      PlayableInfo::Track(track) => Some(track),
+      _ => None,
+    })
+    .collect();
 
   // Apply sort if any
   let mut app = app.lock().await;
@@ -1619,6 +2120,22 @@ impl LibraryNetwork for Network {
       app.playlist_tracks_prefetch_generation
     };
 
+    // A fresh open is served from the disk cache when the playlist has not
+    // changed since it was stored: one small `snapshot_id` request instead of
+    // one request per page. On a miss the tag rides the page chain, which
+    // stores the playlist once its last page lands.
+    let open_snapshot = if playlist_offset == 0 {
+      match self
+        .open_playlist_from_cache(&playlist_id, generation)
+        .await
+      {
+        CachedOpen::Served => return,
+        CachedOpen::Miss { snapshot_id } => snapshot_id,
+      }
+    } else {
+      None
+    };
+
     match fetch_playlist_tracks_page(
       self.spotify(),
       &self.app,
@@ -1653,10 +2170,18 @@ impl LibraryNetwork for Network {
         let generation = app.playlist_tracks_prefetch_generation;
         // Navigation happens in the handler when the user opens the playlist
         // (`App::open_playlist_tracks`), not here on response arrival.
+        if next_offset.is_none() {
+          // A one-page playlist: no chain follows, so store it here.
+          store_completed_playlist(
+            &app.playlist_track_pages.pages,
+            &playlist_id,
+            open_snapshot.as_deref(),
+          );
+        }
         drop(app);
 
         if let Some(next_offset) = next_offset {
-          self.spawn_playlist_tracks_prefetch(playlist_id, next_offset, generation);
+          self.spawn_playlist_tracks_prefetch(playlist_id, next_offset, generation, open_snapshot);
         }
       }
       Err(PlaylistPageError::UnsupportedExternal) => {
@@ -1738,6 +2263,25 @@ impl LibraryNetwork for Network {
         populate_liked_song_ids_from_saved_tracks(app.liked_song_ids_set_mut(), &saved_tracks);
         let domain_page =
           crate::infra::network::mapping::map_page(&saved_tracks, |st| TrackInfo::from(&st.track));
+
+        // A fresh open: the first page doubles as the cache check, so a hit
+        // costs no request beyond the one just made.
+        let key = offset.is_none().then(|| liked_songs_key(&saved_tracks));
+        if let Some(key) = &key {
+          if domain_page.next.is_some() {
+            drop(app);
+            let cached = load_liked_songs(key.clone()).await;
+            app = self.app.lock().await;
+            if app.saved_tracks_prefetch_generation != generation {
+              return;
+            }
+            if let Some(tracks) = cached {
+              apply_cached_liked_songs(&mut app, domain_page, tracks);
+              return;
+            }
+          }
+        }
+
         let saved_tracks_index = app.saved_tracks_mut().upsert_page_by_offset(domain_page);
         app.set_saved_tracks_to_table_continuous();
         app
@@ -1746,10 +2290,14 @@ impl LibraryNetwork for Network {
 
         let next_offset = app.next_missing_saved_tracks_offset(saved_tracks_index);
         let generation = app.saved_tracks_prefetch_generation;
+        if next_offset.is_none() {
+          // Everything fit on one page: store it now, no chain follows.
+          store_liked_songs_if_complete(&app, key.as_ref());
+        }
         drop(app);
 
         if let Some(next_offset) = next_offset {
-          self.spawn_saved_tracks_prefetch(next_offset, generation);
+          self.spawn_saved_tracks_prefetch(next_offset, generation, key);
         }
       }
       Err(e) => {
@@ -2073,10 +2621,25 @@ impl LibraryNetwork for Network {
     // Enqueue and let the single detached worker resolve: these lookups are
     // UI garnish and must never head-of-line-block playback events on the
     // serial pump (see `liked_lookup_worker_task`).
+    // Hearts learned within the last day are applied at once from the heart
+    // cache; only the rest are asked for. Without this, every table rebuild
+    // re-asked for every track, which was most of the app's API traffic.
+    let ids: Vec<String> = ids.iter().map(|id| id.id().to_string()).collect();
+    let (known, unknown) = super::liked_cache::partition_known(ids);
     let spawn = {
       let mut app = self.app.lock().await;
-      for id in &ids {
-        app.liked_lookup_pending.insert(id.id().to_string());
+      if !known.is_empty() {
+        let liked = app.liked_song_ids_set_mut();
+        for (id, is_liked) in known {
+          if is_liked {
+            liked.insert(id);
+          } else {
+            liked.remove(&id);
+          }
+        }
+      }
+      for id in unknown {
+        app.liked_lookup_pending.insert(id);
       }
       if app.liked_lookup_pending.is_empty() || app.liked_lookup_worker_running {
         false
@@ -2420,6 +2983,87 @@ mod tests {
     }
   }
 
+  fn liked(i: usize) -> TrackInfo {
+    TrackInfo::from(&crate::core::test_helpers::full_track(
+      &format!("{i:022}"),
+      &format!("Song {i}"),
+    ))
+  }
+
+  #[test]
+  fn cached_liked_songs_rebuild_contiguous_pages_after_the_first() {
+    let all: Vec<TrackInfo> = (0..8).map(liked).collect();
+    let first = Paged {
+      items: all[..3].to_vec(),
+      offset: 0,
+      limit: 3,
+      total: 8,
+      next: Some("next".to_string()),
+      previous: None,
+    };
+    let pages = saved_track_pages_from_cache(first, all);
+
+    assert_eq!(
+      pages.iter().map(|page| page.offset).collect::<Vec<_>>(),
+      vec![0, 3, 6]
+    );
+    assert_eq!(pages[2].items.len(), 2);
+    assert!(pages[0].next.is_some() && pages[1].next.is_some());
+    assert!(pages[2].next.is_none());
+  }
+
+  #[test]
+  fn a_cached_liked_songs_open_shows_every_song_with_nothing_left_to_load() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(
+      tx,
+      crate::core::user_config::UserConfig::new(),
+      Some(std::time::SystemTime::now()),
+    );
+    app.reset_saved_tracks_view();
+    let all: Vec<TrackInfo> = (0..8).map(liked).collect();
+    let first = Paged {
+      items: all[..3].to_vec(),
+      offset: 0,
+      limit: 3,
+      total: 8,
+      next: Some("next".to_string()),
+      previous: None,
+    };
+
+    apply_cached_liked_songs(&mut app, first, all);
+
+    let names: Vec<String> = app
+      .track_table
+      .tracks
+      .iter()
+      .map(|t| t.name.clone())
+      .collect();
+    assert_eq!(
+      names,
+      (0..8).map(|i| format!("Song {i}")).collect::<Vec<_>>()
+    );
+    let (_, _, has_more) = app.saved_tracks_prefix();
+    assert!(!has_more, "no page chain is needed after a cached open");
+    assert!(
+      app.liked_song_ids_set().contains(&format!("{:022}", 7)),
+      "every cached song is known to be liked"
+    );
+  }
+
+  #[test]
+  fn the_liked_songs_key_ignores_the_page_size() {
+    // Two opens at different terminal heights: same newest songs, different
+    // first-page sizes. The key must not change.
+    let mut small = saved_tracks_page(0, 2, true);
+    let mut large = saved_tracks_page(0, 30, true);
+    let songs: Vec<SavedTrack> = (0..30).map(|i| saved_track(&format!("{i:022}"))).collect();
+    small.items = songs[..12].to_vec();
+    large.items = songs.clone();
+    assert_eq!(liked_songs_key(&small), liked_songs_key(&large));
+    assert_eq!(liked_songs_key(&small).head_ids.len(), LIKED_SONGS_KEY_HEAD);
+  }
+
   #[test]
   fn reconcile_restores_selection_against_folders_first_order() {
     use crate::core::app::{App, PlaylistFolder, PlaylistFolderItem};
@@ -2592,6 +3236,161 @@ mod tests {
     assert!(!is_hidden_spotify_owned_playlist(true, None));
     // Other failures on a Spotify-owned playlist keep their real error.
     assert!(!is_hidden_spotify_owned_playlist(false, Some("spotify")));
+  }
+
+  fn cached_track(position: u32) -> (u32, PlayableInfo) {
+    let id = format!("{position:022}");
+    (
+      position,
+      PlayableInfo::Track(TrackInfo {
+        uri: Some(format!("spotify:track:{id}")),
+        name: format!("Track {position}"),
+        artists: vec!["Artist".to_string()],
+        album: "Album".to_string(),
+        duration_ms: 1,
+        id: Some(id),
+        album_id: None,
+        artist_refs: Vec::new(),
+        is_playable: true,
+        is_local: false,
+        track_number: 1,
+        explicit: false,
+        image_url: None,
+      }),
+    )
+  }
+
+  #[test]
+  fn cached_items_become_contiguous_pages_with_next_on_all_but_the_last() {
+    // 120 positions with a removed track at 60..=69: three pages, the gap kept.
+    let items: Vec<_> = (0..120)
+      .filter(|p| !(60..70).contains(p))
+      .map(cached_track)
+      .collect();
+    let pages = pages_from_cached_items(items);
+
+    assert_eq!(
+      pages.iter().map(|page| page.offset).collect::<Vec<_>>(),
+      vec![0, 50, 100]
+    );
+    assert!(pages[0].next.is_some() && pages[1].next.is_some());
+    assert!(pages[2].next.is_none());
+    assert_eq!(pages[1].items.len(), 40);
+    assert!(pages.iter().all(|page| page.total == 120));
+  }
+
+  #[test]
+  fn an_empty_cached_playlist_is_one_terminal_page() {
+    let pages = pages_from_cached_items(Vec::new());
+    assert_eq!(pages.len(), 1);
+    assert!(pages[0].items.is_empty() && pages[0].next.is_none());
+  }
+
+  #[test]
+  fn cached_pages_round_trip_through_the_completeness_check() {
+    let items: Vec<_> = (0..137).map(cached_track).collect();
+    let pages = pages_from_cached_items(items.clone());
+    assert_eq!(complete_playlist_items(&pages), Some(items));
+  }
+
+  #[test]
+  fn a_partial_load_is_never_treated_as_the_whole_playlist() {
+    let items: Vec<_> = (0..137).map(cached_track).collect();
+    let pages = pages_from_cached_items(items);
+
+    // A missing middle page: a gap between offsets.
+    let gap = vec![pages[0].clone(), pages[2].clone()];
+    assert_eq!(complete_playlist_items(&gap), None);
+    // Interrupted before the last page: no terminal page.
+    assert_eq!(complete_playlist_items(&pages[..2]), None);
+    // A load that started past offset 0.
+    assert_eq!(complete_playlist_items(&pages[1..]), None);
+    assert_eq!(complete_playlist_items(&[]), None);
+  }
+
+  #[test]
+  fn a_cached_open_fills_the_table_with_every_track_and_nothing_left_to_load() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(
+      tx,
+      crate::core::user_config::UserConfig::new(),
+      Some(std::time::SystemTime::now()),
+    );
+    let playlist_id = PlaylistId::from_id("37i9dQZF1DX4WYpdgoIcn6")
+      .unwrap()
+      .into_static();
+    app.reset_playlist_tracks_view(
+      playlist_id,
+      crate::core::app::TrackTableContext::MyPlaylists,
+    );
+
+    let items: Vec<_> = (0..137).filter(|p| *p != 75).map(cached_track).collect();
+    for page in pages_from_cached_items(items) {
+      app.playlist_track_pages.upsert_page_by_offset(page);
+    }
+    app.set_playlist_tracks_to_table_continuous();
+
+    assert_eq!(app.track_table.tracks.len(), 136);
+    assert_eq!(app.track_table.tracks[0].name, "Track 0");
+    assert_eq!(app.track_table.tracks[135].name, "Track 136");
+    let positions = app.playlist_track_positions.clone().unwrap();
+    assert_eq!(positions[75], 76, "positions skip the removed track");
+    assert!(!app.current_playlist_has_more_tracks());
+    assert_eq!(app.next_missing_playlist_tracks_offset_continuous(), None);
+  }
+
+  #[tokio::test]
+  async fn a_second_walk_of_the_same_playlist_waits_for_the_first() {
+    let first = playlist_walk_lock("lockSameA");
+    let guard = first.lock().await;
+    let second = playlist_walk_lock("lockSameA");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(second.try_lock().is_err(), "must wait while a walk runs");
+    drop(guard);
+    assert!(second.try_lock().is_ok(), "free once the walk finishes");
+  }
+
+  #[tokio::test]
+  async fn walks_of_different_playlists_do_not_block_each_other() {
+    let a = playlist_walk_lock("lockDiffA");
+    let _guard = a.lock().await;
+    let b = playlist_walk_lock("lockDiffB");
+    assert!(!Arc::ptr_eq(&a, &b));
+    assert!(b.try_lock().is_ok());
+  }
+
+  #[tokio::test]
+  async fn walk_pacer_spaces_sequential_waits_by_the_interval() {
+    let interval = Duration::from_millis(40);
+    let pacer = WalkPacer::new(interval);
+    let start = tokio::time::Instant::now();
+    for _ in 0..4 {
+      pacer.wait().await;
+    }
+    // The first wait is immediate; the other three each wait one interval.
+    assert!(start.elapsed() >= interval * 3);
+  }
+
+  #[tokio::test]
+  async fn walk_pacer_spaces_concurrent_waiters_too() {
+    let interval = Duration::from_millis(40);
+    let pacer = WalkPacer::new(interval);
+    let start = tokio::time::Instant::now();
+    futures::future::join_all((0..4).map(|_| pacer.wait())).await;
+    assert!(start.elapsed() >= interval * 3);
+  }
+
+  #[tokio::test]
+  async fn walk_pacer_banks_no_burst_credit_while_idle() {
+    let interval = Duration::from_millis(40);
+    let pacer = WalkPacer::new(interval);
+    pacer.wait().await;
+    tokio::time::sleep(interval * 5).await;
+    let start = tokio::time::Instant::now();
+    pacer.wait().await;
+    pacer.wait().await;
+    // After idling, the first wait is immediate but the second still waits.
+    assert!(start.elapsed() >= interval);
   }
 
   #[test]

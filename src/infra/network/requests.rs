@@ -21,8 +21,14 @@ use tokio::sync::Mutex;
 // with up to SPOTIFY_API_BURST requests allowed to start at once so the
 // concurrent fan-outs (search joins five queries, the artist page two) aren't
 // artificially staggered.
+//
+// About 3 requests a second sustained (Spotify's own figure for its limit is
+// unpublished). At 4/s, long page loads kept a Development Mode app at the
+// ceiling for minutes and earned day-long `Retry-After` penalties. The burst
+// above is derived from this interval, so single actions and the five-query
+// search still start at once; only long runs of requests spread out.
 static SPOTIFY_API_PACING: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-const SPOTIFY_API_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const SPOTIFY_API_MIN_INTERVAL: Duration = Duration::from_millis(334);
 const SPOTIFY_API_BURST: u32 = 5;
 const SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1/";
 
@@ -46,8 +52,27 @@ const FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const UNAUTHORIZED_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Longest `Retry-After` honored: a bound on the window, so a bogus header
-/// value can neither park the app for a day nor overflow the deadline.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// value cannot overflow the deadline or park the app indefinitely. Spotify
+/// does send real penalties of most of a day to Development Mode apps; a
+/// lower cap made the app retry early, get a fresh 429, and show a misleading
+/// restarted countdown, so the bound sits well above any genuine value.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// A wait as people read it: `45s`, `9m 59s`, `21h 22m`, `1d 3h`.
+pub(crate) fn format_wait(secs: u64) -> String {
+  let (days, hours, minutes, seconds) = (
+    secs / 86_400,
+    secs % 86_400 / 3_600,
+    secs % 3_600 / 60,
+    secs % 60,
+  );
+  match secs {
+    0..=59 => format!("{seconds}s"),
+    60..=3_599 => format!("{minutes}m {seconds}s"),
+    3_600..=86_399 => format!("{hours}h {minutes}m"),
+    _ => format!("{days}d {hours}h"),
+  }
+}
 
 /// Total time the sends and retries of one Spotify call may take: one full
 /// attempt plus a backoff. A token refresh is never cut short, so it comes on
@@ -587,8 +612,8 @@ where
       SpotifyApiError {
         status: reqwest::StatusCode::TOO_MANY_REQUESTS,
         body: format!(
-          "rate limited by Spotify, retry in {}s",
-          left.as_secs().max(1)
+          "rate limited by Spotify, retry in {}",
+          format_wait(left.as_secs().max(1))
         ),
         detail: None,
         endpoint: Some(endpoint.clone()),
@@ -805,7 +830,7 @@ where
       return Err(
         SpotifyApiError {
           status,
-          body: format!("rate limited by Spotify, retry in {window}s"),
+          body: format!("rate limited by Spotify, retry in {}", format_wait(window)),
           detail: None,
           endpoint: Some(endpoint),
         }
@@ -2169,6 +2194,21 @@ mod tests {
 
     let left = gate.rate_limit_remaining().await.unwrap();
     assert!(left > Duration::from_secs(20), "{left:?}");
+  }
+
+  #[test]
+  fn format_wait_reads_naturally_at_every_scale() {
+    assert_eq!(format_wait(17), "17s");
+    assert_eq!(format_wait(599), "9m 59s");
+    assert_eq!(format_wait(76_902), "21h 21m");
+    assert_eq!(format_wait(97_200), "1d 3h");
+  }
+
+  #[test]
+  fn a_day_long_retry_after_is_honored_not_capped() {
+    // Spotify sent a real 76902s (~21h) penalty; capping it lower made the app
+    // retry early and restart a misleading countdown.
+    assert!(Duration::from_secs(76_902) <= MAX_RETRY_AFTER);
   }
 
   #[tokio::test]

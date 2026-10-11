@@ -847,7 +847,7 @@ impl StreamingPlayer {
         _ => librespot_playback::config::Bitrate::Bitrate320,
       },
       // Enable periodic position updates for real-time playbar progress
-      position_update_interval: Some(std::time::Duration::from_secs(1)),
+      position_update_interval: Some(std::time::Duration::from_millis(100)),
       ..Default::default()
     };
 
@@ -1150,6 +1150,38 @@ impl StreamingPlayer {
   pub fn play(&self) {
     if let Err(error) = self.route_command(DeferredPlayerCommand::Play) {
       warn!("native play failed: {error}");
+    }
+  }
+
+  /// Make Spirc send its Connect state to Spotify again, without touching
+  /// playback. Every Spirc command ends with a state push, and a command that
+  /// matches the current state changes nothing: `Play` while playing (or
+  /// loading) and `Pause` while paused are no-ops in `handle_play` and
+  /// `handle_pause`. Used after changes Spirc only learns from player events
+  /// (a gapless track change, a seek sent straight to the player), whose state
+  /// it otherwise fails to push, so other clients and Discord showed stale
+  /// state until the next pause and resume. `playing` must be the state the
+  /// player is in: the wrong one would pause or resume it. Only sent while
+  /// connected.
+  pub fn resend_connect_state(&self, playing: bool) {
+    let connected = matches!(
+      self
+        .command_router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mode,
+      SpircCommandMode::Connected
+    );
+    if !connected {
+      return;
+    }
+    let result = if playing {
+      self.with_spirc(|spirc| spirc.play())
+    } else {
+      self.with_spirc(|spirc| spirc.pause())
+    };
+    if let Err(error) = result {
+      log::debug!("could not re-send the connect state: {error:?}");
     }
   }
 

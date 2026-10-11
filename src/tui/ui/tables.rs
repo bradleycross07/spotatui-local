@@ -741,24 +741,49 @@ fn draw_table(
   let selected_style = get_color(highlight_state, app.user_config.theme)
     .add_modifier(Modifier::BOLD | Modifier::REVERSED);
 
-  let track_playing_index = app.current_playback_context.as_ref().and_then(|ctx| {
-    ctx.item.as_ref().and_then(|item| match item {
-      PlayableItem::Track(track) => {
-        let track_id_str = track.id.as_ref().map(|id| id.id().to_string());
-        items.iter().position(|item| {
-          track_id_str
-            .as_ref()
-            .map(|id| id == &item.id)
-            .unwrap_or(false)
-        })
-      }
-      PlayableItem::Episode(episode) => {
-        let episode_id_str = episode.id.id().to_string();
-        items.iter().position(|item| episode_id_str == item.id)
-      }
-      _ => None,
+  // When the built-in player owns playback, the polled Web API context lags
+  // after a skip and never reports natively queued tracks (#402). Use the id
+  // librespot handed us on TrackChanged instead: the same source the playbar
+  // reads, so the table marker and the playbar always agree. Playing on another
+  // device clears `is_streaming_active`, falling back to the API context below.
+  let native_playing_id =
+    (app.is_streaming_active && app.native_track_info.is_some() && !app.active_decoded_source())
+      .then(|| app.last_track_id.as_deref())
+      .flatten();
+
+  let track_playing_index = if let Some(id) = native_playing_id {
+    items.iter().position(|item| item.id == id).or_else(|| {
+      // A relinked track: librespot reports another release's id. Find the
+      // row by title, artist and length instead, then locate it by its own id.
+      let info = app.native_track_info.as_ref()?;
+      let row = app
+        .track_table
+        .tracks
+        .iter()
+        .find(|track| info.describes(track))?;
+      let row_id = row.id.as_deref()?;
+      items.iter().position(|item| item.id == row_id)
     })
-  });
+  } else {
+    app.current_playback_context.as_ref().and_then(|ctx| {
+      ctx.item.as_ref().and_then(|item| match item {
+        PlayableItem::Track(track) => {
+          let track_id_str = track.id.as_ref().map(|id| id.id().to_string());
+          items.iter().position(|item| {
+            track_id_str
+              .as_ref()
+              .map(|id| id == &item.id)
+              .unwrap_or(false)
+          })
+        }
+        PlayableItem::Episode(episode) => {
+          let episode_id_str = episode.id.id().to_string();
+          items.iter().position(|item| episode_id_str == item.id)
+        }
+        _ => None,
+      })
+    })
+  };
 
   let (title, header) = table_layout;
 
