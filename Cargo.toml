@@ -244,7 +244,7 @@ ts-rs = "=12.0.1"
 # librespot-core 0.8.0's build script on a fresh resolve (#350). Remove once
 # librespot ships a fix.
 [build-dependencies]
-vergen = { version = ">=9.0.6, <9.1", default-features = false }
+vergen = { version = ">=9.0.6, <10.1", default-features = false }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
